@@ -1,0 +1,124 @@
+#include <SPI.h>
+#include <RF24.h>
+
+constexpr uint8_t NRF_CE_PIN  = 9;
+constexpr uint8_t NRF_CSN_PIN = 10;
+const uint8_t RADIO_ADDRESS[6] = "TLM01";
+
+RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
+
+struct __attribute__((packed)) TelemetryPacket {
+  uint8_t protocolVersion;
+  uint8_t mode;
+  uint8_t motorAction;
+  int16_t leftSpeed;
+  int16_t rightSpeed;
+  uint16_t sequence;
+  int32_t latitudeE6;
+  int32_t longitudeE6;
+  uint8_t satellites;
+  uint8_t currentWp;
+  uint8_t totalWp;
+};
+
+struct __attribute__((packed)) CommandPacket {
+  uint8_t cmdType;
+  uint8_t wpIndex;
+  uint8_t wpTotal;
+  int32_t targetLatE6;
+  int32_t targetLonE6;
+};
+
+// Массив очереди команд на 25 элементов
+CommandPacket cmdQueue[25];
+uint8_t qHead = 0;
+uint8_t qTail = 0;
+
+void enqueueCommand(CommandPacket cmd) {
+  uint8_t next = (qHead + 1) % 25;
+  if (next != qTail) {
+    cmdQueue[qHead] = cmd;
+    qHead = next;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!radio.begin()) {
+    Serial.println(F("ERR:NRF24"));
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  radio.setChannel(76);
+  radio.setDataRate(RF24_1MBPS);
+  radio.setPALevel(RF24_PA_HIGH);
+  radio.setRetries(5, 15);
+  radio.setCRCLength(RF24_CRC_16);
+
+  radio.enableDynamicPayloads();
+  radio.enableAckPayload();
+
+  radio.openReadingPipe(1, RADIO_ADDRESS);
+  radio.startListening();
+
+  CommandPacket emptyCmd = {0, 0, 0, 0, 0};
+  radio.writeAckPayload(1, &emptyCmd, sizeof(emptyCmd));
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("WP,")) {
+      int p1 = line.indexOf(',');
+      int p2 = line.indexOf(',', p1 + 1);
+      int p3 = line.indexOf(',', p2 + 1);
+      int p4 = line.indexOf(',', p3 + 1);
+
+      CommandPacket cmd;
+      cmd.cmdType = 1;
+      cmd.wpIndex = line.substring(p1 + 1, p2).toInt();
+      cmd.wpTotal = line.substring(p2 + 1, p3).toInt();
+      cmd.targetLatE6 = line.substring(p3 + 1, p4).toInt();
+      cmd.targetLonE6 = line.substring(p4 + 1).toInt();
+      enqueueCommand(cmd);
+    } 
+    else if (line == "START") {
+      CommandPacket cmd = {2, 0, 0, 0, 0};
+      enqueueCommand(cmd);
+    } 
+    else if (line == "STOP") {
+      CommandPacket cmd = {3, 0, 0, 0, 0};
+      enqueueCommand(cmd);
+    }
+  }
+
+  while (radio.available()) {
+    TelemetryPacket tlm;
+    radio.read(&tlm, sizeof(tlm));
+
+    // Формат: TLM,mode,action,leftSpd,rightSpd,lat,lon,sats,wp
+    Serial.print(F("TLM,"));
+    Serial.print(tlm.mode); Serial.print(',');
+    Serial.print(tlm.motorAction); Serial.print(',');
+    Serial.print(tlm.leftSpeed); Serial.print(',');
+    Serial.print(tlm.rightSpeed); Serial.print(',');
+    Serial.print(tlm.latitudeE6 / 1000000.0, 6); Serial.print(',');
+    Serial.print(tlm.longitudeE6 / 1000000.0, 6); Serial.print(',');
+    Serial.print(tlm.satellites); Serial.print(',');
+    Serial.print(tlm.currentWp); Serial.print('/');
+    Serial.println(tlm.totalWp);
+
+    if (qTail != qHead) {
+      radio.writeAckPayload(1, &cmdQueue[qTail], sizeof(CommandPacket));
+      qTail = (qTail + 1) % 25;
+    } else {
+      CommandPacket emptyCmd = {0, 0, 0, 0, 0};
+      radio.writeAckPayload(1, &emptyCmd, sizeof(emptyCmd));
+    }
+  }
+}
