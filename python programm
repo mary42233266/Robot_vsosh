@@ -1,0 +1,244 @@
+import tkinter as tk
+import tkintermapview
+import serial
+import threading
+import time
+
+SERIAL_PORT = 'COM6'
+BAUD_RATE = 115200
+
+waypoints = []
+waypoint_markers = []
+route_path = None
+
+robot_track = []
+robot_track_path = None
+robot_marker = None
+last_robot_coords = None
+
+ser = None
+running = True
+
+def connect_serial():
+    global ser
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        time.sleep(2)
+        status_label.config(text=f"Подключено к {SERIAL_PORT}", fg="green")
+        threading.Thread(target=read_telemetry, daemon=True).start()
+    except Exception as e:
+        status_label.config(text=f"Ошибка порта {SERIAL_PORT}: {e}", fg="red")
+
+def read_telemetry():
+    actions = [
+        "СТОП",
+        "ВПЕРЕД",
+        "НАЗАД",
+        "ПОВОРОТ НАПРАВО",
+        "ПОВОРОТ НАЛЕВО",
+        "АВТОПИЛОТ (ДВИЖЕНИЕ ПО КУРСУ)"
+    ]
+    modes = ["Ручной", "Автопилот"]
+
+    while running and ser and ser.is_open:
+        try:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if line.startswith("TLM,"):
+                parts = line.split(',')
+                # Формат: TLM,mode,action,leftSpd,rightSpd,lat,lon,sats,wp
+                if len(parts) < 9:
+                    continue
+
+                mode_idx = int(parts[1])
+                mode_str = modes[mode_idx] if mode_idx < len(modes) else "Неизв."
+
+                act_idx = int(parts[2])
+                act_str = actions[act_idx] if act_idx < len(actions) else "НЕИЗВЕСТНО"
+
+                left_spd = parts[3]
+                right_spd = parts[4]
+                lat = float(parts[5])
+                lon = float(parts[6])
+                sats = parts[7]
+                wp_progress = parts[8]
+
+                root.after(0, update_ui, mode_str, act_str, left_spd, right_spd, lat, lon, sats, wp_progress)
+        except Exception as e:
+            print("Ошибка разбора:", e)
+
+def update_ui(mode_str, act_str, left_spd, right_spd, lat, lon, sats, wp_progress):
+    global robot_marker, robot_track_path, last_robot_coords
+
+    motor_label.config(
+        text=f"МОТОРЫ: {act_str}   [Левый: {left_spd} | Правый: {right_spd}]"
+    )
+    tlm_label.config(
+        text=f"Режим: {mode_str} | Спутники: {sats} | Точка: {wp_progress}"
+    )
+
+    # Обновление местоположения робота на карте
+    if lat != 0.0 and lon != 0.0:
+        last_robot_coords = (lat, lon)
+        coords_label.config(
+            text=f"ГДЕ РОБОТ СЕЙЧАС:  Широта {lat:.6f}  |  Долгота {lon:.6f}",
+            fg="#0066CC"
+        )
+
+        if robot_marker is None:
+            robot_marker = map_widget.set_marker(
+                lat, lon,
+                text="РОБОТ (ЗДЕСЬ)",
+                marker_color_circle="#FF0000",
+                marker_color_outside="#990000"
+            )
+            map_widget.set_position(lat, lon)
+        else:
+            robot_marker.set_position(lat, lon)
+
+        # Добавляем точку в след движения, если робот сдвинулся
+        if not robot_track or robot_track[-1] != (lat, lon):
+            robot_track.append((lat, lon))
+            if len(robot_track) > 200:
+                robot_track.pop(0)
+            if len(robot_track) > 1:
+                if robot_track_path is None:
+                    robot_track_path = map_widget.set_path(robot_track, color="#00AA44", width=3)
+                else:
+                    robot_track_path.set_position_list(robot_track)
+    else:
+        coords_label.config(
+            text="ГДЕ РОБОТ СЕЙЧАС:  Ожидание сигнала со спутников GPS...",
+            fg="#CC6600"
+        )
+
+def center_on_robot():
+    if last_robot_coords:
+        map_widget.set_position(last_robot_coords[0], last_robot_coords[1])
+        map_widget.set_zoom(18)
+    else:
+        status_label.config(text="Координаты робота еще не получены!", fg="orange")
+
+def add_waypoint(coords):
+    global route_path
+    if len(waypoints) >= 19:
+        status_label.config(text="Максимум 19 точек!", fg="orange")
+        return
+    lat, lon = coords
+    waypoints.append((lat, lon))
+    m = map_widget.set_marker(
+        lat, lon,
+        text=f"#{len(waypoints)}",
+        marker_color_circle="#1E90FF",
+        marker_color_outside="#004C99"
+    )
+    waypoint_markers.append(m)
+    if len(waypoints) > 1:
+        if route_path is None:
+            route_path = map_widget.set_path(waypoints, color="#1E90FF", width=3)
+        else:
+            route_path.set_position_list(waypoints)
+
+def clear_route():
+    global route_path, robot_track_path
+    waypoints.clear()
+    for m in waypoint_markers:
+        m.delete()
+    waypoint_markers.clear()
+
+    if route_path is not None:
+        route_path.delete()
+        route_path = None
+
+    robot_track.clear()
+    if robot_track_path is not None:
+        robot_track_path.delete()
+        robot_track_path = None
+
+    status_label.config(text="Маршрут и след очищены", fg="black")
+
+def send_and_start():
+    if not ser or not ser.is_open:
+        status_label.config(text="Нет подключения к береговой Arduino!", fg="red")
+        return
+    if not waypoints:
+        status_label.config(text="Сначала поставьте точки на карте левым кликом!", fg="red")
+        return
+
+    # Добавляем первую точку в конец для автоматического возврата домой
+    full_route = waypoints + [waypoints[0]]
+    total = len(full_route)
+
+    for idx, (lat, lon) in enumerate(full_route):
+        lat_e6 = int(round(lat * 1_000_000))
+        lon_e6 = int(round(lon * 1_000_000))
+        cmd = f"WP,{idx},{total},{lat_e6},{lon_e6}\n"
+        ser.write(cmd.encode('utf-8'))
+        time.sleep(0.05)
+
+    ser.write(b"START\n")
+    status_label.config(text=f"Маршрут ({total} тчк с возвратом) отправлен!", fg="blue")
+
+def emergency_stop():
+    if ser and ser.is_open:
+        ser.write(b"STOP\n")
+        status_label.config(text="Отправлена команда СТОП!", fg="red")
+
+def on_closing():
+    global running
+    running = False
+    if ser and ser.is_open:
+        ser.close()
+    root.destroy()
+
+# --- Интерфейс ---
+root = tk.Tk()
+root.title("Управление водным роботом-сборщиком")
+root.geometry("980x700")
+root.protocol("WM_DELETE_WINDOW", on_closing)
+
+top_bar = tk.Frame(root)
+top_bar.pack(fill="x", padx=10, pady=5)
+
+status_label = tk.Label(top_bar, text="Ожидание подключения...", font=("Arial", 10, "bold"))
+status_label.pack(side="left")
+
+tlm_label = tk.Label(top_bar, text="Телеметрия: нет данных", font=("Arial", 10))
+tlm_label.pack(side="right")
+
+coords_label = tk.Label(
+    root,
+    text="ГДЕ РОБОТ СЕЙЧАС:  Ожидание данных...",
+    font=("Arial", 11, "bold"),
+    bg="#EEF5FF",
+    fg="#333333",
+    pady=5
+)
+coords_label.pack(fill="x", padx=10, pady=(0, 4))
+
+motor_label = tk.Label(
+    root,
+    text="МОТОРЫ: ОЖИДАНИЕ ДАННЫХ ОТ РОБОТА...",
+    font=("Arial", 12, "bold"),
+    bg="#222222",
+    fg="#00FF66",
+    pady=7
+)
+motor_label.pack(fill="x", padx=10, pady=(0, 5))
+
+map_widget = tkintermapview.TkinterMapView(root, width=980, height=520, corner_radius=0)
+map_widget.pack(fill="both", expand=True)
+
+map_widget.set_position(55.3240, 86.1988)
+map_widget.set_zoom(17)
+map_widget.add_left_click_map_command(add_waypoint)
+
+btn_frame = tk.Frame(root)
+btn_frame.pack(fill="x", pady=10)
+
+tk.Button(btn_frame, text="Найти робота", command=center_on_robot, bg="#E0EFFF", font=("Arial", 9, "bold"), width=15).pack(side="left", padx=10)
+tk.Button(btn_frame, text="Очистить маршрут", command=clear_route, width=16).pack(side="left", padx=10)
+tk.Button(btn_frame, text="ЭКСТРЕННЫЙ СТОП", command=emergency_stop, bg="#ff4d4d", fg="white", font=("Arial", 10, "bold"), width=18).pack(side="left", padx=10)
+tk.Button(btn_frame, text="Отправить маршрут и СТАРТ", command=send_and_start, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), width=24).pack(side="right", padx=15)
+
+connect_serial()
+root.mainloop()
